@@ -164,11 +164,25 @@ interface InternalNode extends LavalinkNodeOptions {
 	closing?: boolean;
 }
 
+type VoiceServerRawEvent = {
+        token: string;
+        endpoint: string | null;
+        guild_id: string;
+        [key: string]: any;
+};
+
+interface VoiceServerState {
+        token: string;
+        endpoint: string | null;
+        guildId: string;
+        rawEvent: VoiceServerRawEvent;
+}
+
 interface LavalinkPlayerState {
-	node?: InternalNode;
-	channelId?: string | null;
-	voiceState?: { sessionId?: string | null; channelId?: string | null };
-	voiceServer?: { token: string; endpoint: string | null };
+        node?: InternalNode;
+        channelId?: string | null;
+        voiceState?: { sessionId?: string | null; channelId?: string | null };
+        voiceServer?: VoiceServerState;
 	track?: Track | null;
 	playing: boolean;
 	paused: boolean;
@@ -559,10 +573,27 @@ export class lavalinkExt extends BaseExtension {
 		const state = this.playerStates.get(player);
 		if (!state) return;
 
-		if (t === "VOICE_SERVER_UPDATE") {
-			if (!data?.token) return;
-			state.voiceServer = { token: data.token, endpoint: data.endpoint ?? null };
-			this.debug(`VOICE_SERVER_UPDATE for guild ${guildId}`);
+                if (t === "VOICE_SERVER_UPDATE") {
+                        const token: string | undefined = data?.token;
+                        if (!token) return;
+                        const endpoint: string | null = typeof data?.endpoint === "string" ? data.endpoint : null;
+                        const resolvedGuildId = String(data?.guild_id ?? data?.guildId ?? guildId);
+                        const rawEvent: VoiceServerRawEvent = {
+                                ...(typeof data === "object" && data !== null ? data : {}),
+                                token,
+                                endpoint,
+                                guild_id: resolvedGuildId,
+                        };
+                        if ("guildId" in rawEvent) {
+                                delete rawEvent.guildId;
+                        }
+                        state.voiceServer = {
+                                token,
+                                endpoint,
+                                guildId: resolvedGuildId,
+                                rawEvent,
+                        };
+                        this.debug(`VOICE_SERVER_UPDATE for guild ${guildId}`);
 		} else if (t === "VOICE_STATE_UPDATE") {
 			const userId = data?.user_id ?? data?.userId;
 			if (this.userId && userId !== this.userId) return;
@@ -1083,14 +1114,19 @@ export class lavalinkExt extends BaseExtension {
 	private async sendVoiceUpdate(node: InternalNode, guildId: string, state: LavalinkPlayerState): Promise<void> {
 		if (!node.ws || node.ws.readyState !== WebSocket.OPEN) return;
 		if (!state.voiceState?.sessionId || !state.voiceServer) return;
-		const payload = {
-			op: "voiceUpdate",
-			guildId,
-			sessionId: state.voiceState.sessionId,
-			event: state.voiceServer,
-		};
-		node.ws.send(JSON.stringify(payload));
-	}
+                const eventPayload = state.voiceServer.rawEvent ?? {
+                        token: state.voiceServer.token,
+                        endpoint: state.voiceServer.endpoint,
+                        guild_id: state.voiceServer.guildId ?? guildId,
+                };
+                const payload = {
+                        op: "voiceUpdate",
+                        guildId,
+                        sessionId: state.voiceState.sessionId,
+                        event: eventPayload,
+                };
+                node.ws.send(JSON.stringify(payload));
+        }
 
 	private pause(player: Player): boolean {
 		const state = this.playerStates.get(player);
