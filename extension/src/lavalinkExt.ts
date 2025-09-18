@@ -714,49 +714,52 @@ export class lavalinkExt extends BaseExtension {
 		this.guildMap.delete(player.guildId);
 	}
 
-	async beforePlay(context: ExtensionContext, payload: ExtensionPlayRequest): Promise<ExtensionPlayResponse> {
-		const player = context.player;
-		this.attachToPlayer(player);
-		this.maybeConnectNodes();
+        async beforePlay(context: ExtensionContext, payload: ExtensionPlayRequest): Promise<ExtensionPlayResponse> {
+                const player = context.player;
+                this.attachToPlayer(player);
+                this.maybeConnectNodes();
 
-		const requestedBy = payload.requestedBy ?? "Unknown";
-		try {
-			const { tracks, isPlaylist } = await this.resolvePlayRequest(player, payload.query, requestedBy);
-			if (tracks.length === 0) {
-				return {
-					handled: true,
-					success: false,
-					error: new Error("No tracks found"),
-				};
-			}
+                const requestedBy = payload.requestedBy ?? "Unknown";
+                let queued = false;
 
-			if (isPlaylist) {
-				player.queue.addMultiple(tracks);
-				player.emit("queueAddList", tracks);
-			} else {
-				player.queue.add(tracks[0]);
-				player.emit("queueAdd", tracks[0]);
-			}
+                try {
+                        const { tracks, isPlaylist } = await this.resolvePlayRequest(player, payload.query, requestedBy);
+                        if (tracks.length === 0) {
+                                return {
+                                        handled: false,
+                                        success: false,
+                                        error: new Error("No tracks found"),
+                                };
+                        }
 
-			const state = this.playerStates.get(player);
-			const shouldStart = !(state?.playing ?? false) && !(player.isPlaying ?? false);
-			const success = shouldStart ? await this.startNextOnLavalink(player) : true;
+                        if (isPlaylist) {
+                                player.queue.addMultiple(tracks);
+                                player.emit("queueAddList", tracks);
+                        } else {
+                                player.queue.add(tracks[0]);
+                                player.emit("queueAdd", tracks[0]);
+                        }
+                        queued = true;
 
-			return {
-				handled: true,
-				success,
-				isPlaylist,
-			};
-		} catch (error) {
-			const err = error instanceof Error ? error : new Error(String(error));
-			this.debug(`beforePlay error: ${err.message}`);
-			return {
-				handled: true,
-				success: false,
-				error: err,
-			};
-		}
-	}
+                        const state = this.playerStates.get(player);
+                        const shouldStart = !(state?.playing ?? false) && !(player.isPlaying ?? false);
+                        const success = shouldStart ? await this.startNextOnLavalink(player) : true;
+
+                        return {
+                                handled: true,
+                                success,
+                                isPlaylist,
+                        };
+                } catch (error) {
+                        const err = error instanceof Error ? error : new Error(String(error));
+                        this.debug(`beforePlay error: ${err.message}`);
+                        return {
+                                handled: queued,
+                                success: false,
+                                error: err,
+                        };
+                }
+        }
 
 	async provideSearch(_context: ExtensionContext, payload: ExtensionSearchRequest): Promise<SearchResult | null> {
 		try {
