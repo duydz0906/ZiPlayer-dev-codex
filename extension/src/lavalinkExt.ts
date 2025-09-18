@@ -576,7 +576,8 @@ export class lavalinkExt extends BaseExtension {
                 if (t === "VOICE_SERVER_UPDATE") {
                         const token: string | undefined = data?.token;
                         if (!token) return;
-                        const endpoint: string | null = typeof data?.endpoint === "string" ? data.endpoint : null;
+                        const rawEndpoint: string | null = typeof data?.endpoint === "string" ? data.endpoint : null;
+                        const endpoint = this.normalizeVoiceEndpoint(rawEndpoint);
                         const resolvedGuildId = String(data?.guild_id ?? data?.guildId ?? guildId);
                         const rawEvent: VoiceServerRawEvent = {
                                 ...(typeof data === "object" && data !== null ? data : {}),
@@ -1111,9 +1112,8 @@ export class lavalinkExt extends BaseExtension {
 		state.paused = false;
 	}
 
-	private async sendVoiceUpdate(node: InternalNode, guildId: string, state: LavalinkPlayerState): Promise<void> {
-		if (!node.ws || node.ws.readyState !== WebSocket.OPEN) return;
-		if (!state.voiceState?.sessionId || !state.voiceServer) return;
+        private async sendVoiceUpdate(node: InternalNode, guildId: string, state: LavalinkPlayerState): Promise<void> {
+                if (!state.voiceState?.sessionId || !state.voiceServer?.token || !state.voiceServer.endpoint) return;
                 const eventPayload = state.voiceServer.rawEvent ?? {
                         token: state.voiceServer.token,
                         endpoint: state.voiceServer.endpoint,
@@ -1125,7 +1125,28 @@ export class lavalinkExt extends BaseExtension {
                         sessionId: state.voiceState.sessionId,
                         event: eventPayload,
                 };
-                node.ws.send(JSON.stringify(payload));
+                if (node.ws && node.ws.readyState === WebSocket.OPEN) {
+                        node.ws.send(JSON.stringify(payload));
+                }
+
+                if (!node.sessionId) return;
+
+                try {
+                        await node.rest.patch(`/sessions/${node.sessionId}/players/${guildId}`, {
+                                voice: {
+                                        token: state.voiceServer.token,
+                                        endpoint: state.voiceServer.endpoint,
+                                        sessionId: state.voiceState.sessionId,
+                                },
+                        });
+                } catch (error) {
+                        this.debug(`Failed to persist voice state for ${guildId} on ${node.identifier}`, error);
+                }
+        }
+
+        private normalizeVoiceEndpoint(endpoint: string | null | undefined): string | null {
+                if (!endpoint || typeof endpoint !== "string") return null;
+                return endpoint.replace(/:(?:80|443)$/i, "");
         }
 
 	private pause(player: Player): boolean {
