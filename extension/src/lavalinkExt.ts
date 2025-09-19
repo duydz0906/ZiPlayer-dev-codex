@@ -329,18 +329,24 @@ export class lavalinkExt extends BaseExtension {
 		}
 	}
 
-	private maybeConnectNodes(): void {
-		if (this.wsReady) return;
-		if (!this.userId && !this.client?.user?.id) return;
-		if (!this.userId && this.client?.user?.id) {
-			this.userId = this.client.user.id;
-		}
-		if (!this.userId) return;
-		this.wsReady = true;
-		for (const node of this.nodes) {
-			this.connectNode(node).catch((error) => this.debug(`Failed to connect node ${node.identifier}`, error));
-		}
-	}
+        private maybeConnectNodes(): void {
+                if (!this.userId && !this.client?.user?.id) return;
+                if (!this.userId && this.client?.user?.id) {
+                        this.userId = this.client.user.id;
+                }
+                if (!this.userId) return;
+
+                if (!this.wsReady) {
+                        this.wsReady = true;
+                }
+
+                for (const node of this.nodes) {
+                        if (node.connected || node.connecting || node.closing) continue;
+                        this.connectNode(node).catch((error) =>
+                                this.debug(`Failed to connect node ${node.identifier}`, error),
+                        );
+                }
+        }
 
 	private async connectNode(node: InternalNode): Promise<void> {
 		if (node.connecting || node.connected || node.closing) return;
@@ -668,12 +674,32 @@ export class lavalinkExt extends BaseExtension {
 				connect: player.connect.bind(player),
 			});
 
-			(player as any).skip = () => this.skip(player);
-			(player as any).stop = () => this.stop(player);
-			(player as any).pause = () => this.pause(player);
-			(player as any).resume = () => this.resume(player);
-			(player as any).setVolume = (volume: number) => this.setVolume(player, volume);
-			(player as any).connect = async (channel: any) => this.connect(player, channel);
+                        (player as any).skip = () => {
+                                const handled = this.skip(player);
+                                if (handled) return true;
+                                const original = this.originalMethods.get(player)?.skip;
+                                return original ? original() : handled;
+                        };
+                        (player as any).stop = () => {
+                                const handled = this.stop(player);
+                                if (handled) return true;
+                                const original = this.originalMethods.get(player)?.stop;
+                                return original ? original() : handled;
+                        };
+                        (player as any).pause = () => {
+                                const handled = this.pause(player);
+                                if (handled) return true;
+                                const original = this.originalMethods.get(player)?.pause;
+                                return original ? original() : handled;
+                        };
+                        (player as any).resume = () => {
+                                const handled = this.resume(player);
+                                if (handled) return true;
+                                const original = this.originalMethods.get(player)?.resume;
+                                return original ? original() : handled;
+                        };
+                        (player as any).setVolume = (volume: number) => this.setVolume(player, volume);
+                        (player as any).connect = async (channel: any) => this.connect(player, channel);
 		}
 
 		const onDestroy = () => {
@@ -714,49 +740,56 @@ export class lavalinkExt extends BaseExtension {
 		this.guildMap.delete(player.guildId);
 	}
 
-	async beforePlay(context: ExtensionContext, payload: ExtensionPlayRequest): Promise<ExtensionPlayResponse> {
-		const player = context.player;
-		this.attachToPlayer(player);
-		this.maybeConnectNodes();
+        async beforePlay(context: ExtensionContext, payload: ExtensionPlayRequest): Promise<ExtensionPlayResponse> {
+                const player = context.player;
+                this.attachToPlayer(player);
+                this.maybeConnectNodes();
 
-		const requestedBy = payload.requestedBy ?? "Unknown";
-		try {
-			const { tracks, isPlaylist } = await this.resolvePlayRequest(player, payload.query, requestedBy);
-			if (tracks.length === 0) {
-				return {
-					handled: true,
-					success: false,
-					error: new Error("No tracks found"),
-				};
-			}
+                const requestedBy = payload.requestedBy ?? "Unknown";
+                let queued = false;
 
-			if (isPlaylist) {
-				player.queue.addMultiple(tracks);
-				player.emit("queueAddList", tracks);
-			} else {
-				player.queue.add(tracks[0]);
-				player.emit("queueAdd", tracks[0]);
-			}
+                try {
+                        const { tracks, isPlaylist } = await this.resolvePlayRequest(player, payload.query, requestedBy);
+                        if (tracks.length === 0) {
+                                this.cleanupIdleNodes();
+                                return {
+                                        handled: false,
+                                        success: false,
+                                        error: new Error("No tracks found"),
+                                };
+                        }
 
-			const state = this.playerStates.get(player);
-			const shouldStart = !(state?.playing ?? false) && !(player.isPlaying ?? false);
-			const success = shouldStart ? await this.startNextOnLavalink(player) : true;
+                        if (isPlaylist) {
+                                player.queue.addMultiple(tracks);
+                                player.emit("queueAddList", tracks);
+                        } else {
+                                player.queue.add(tracks[0]);
+                                player.emit("queueAdd", tracks[0]);
+                        }
+                        queued = true;
 
-			return {
-				handled: true,
-				success,
-				isPlaylist,
-			};
-		} catch (error) {
-			const err = error instanceof Error ? error : new Error(String(error));
-			this.debug(`beforePlay error: ${err.message}`);
-			return {
-				handled: true,
-				success: false,
-				error: err,
-			};
-		}
-	}
+                        const state = this.playerStates.get(player);
+                        const shouldStart = !(state?.playing ?? false) && !(player.isPlaying ?? false);
+                        const success = shouldStart ? await this.startNextOnLavalink(player) : true;
+
+                        return {
+                                handled: true,
+                                success,
+                                isPlaylist,
+                        };
+                } catch (error) {
+                        const err = error instanceof Error ? error : new Error(String(error));
+                        this.debug(`beforePlay error: ${err.message}`);
+                        if (!queued) {
+                                this.cleanupIdleNodes();
+                        }
+                        return {
+                                handled: queued,
+                                success: false,
+                                error: err,
+                        };
+                }
+        }
 
 	async provideSearch(_context: ExtensionContext, payload: ExtensionSearchRequest): Promise<SearchResult | null> {
 		try {
@@ -912,14 +945,13 @@ export class lavalinkExt extends BaseExtension {
 		if (!state) throw new Error("Missing player state");
 
 		let node = state.node;
-		if (!node || !node.connected || !node.ws || node.ws.readyState !== WebSocket.OPEN) {
-			const picked = this.selectNode();
-			if (!picked) throw new Error("No Lavalink nodes available");
-			node = picked;
-			state.node = node;
-			node.players.add(player.guildId);
-			this.debug(`Assigned node ${node.identifier} to guild ${player.guildId}`);
-		}
+                if (!node || !node.connected || !node.ws || node.ws.readyState !== WebSocket.OPEN) {
+                        const picked = this.selectNode();
+                        if (!picked) throw new Error("No Lavalink nodes available");
+                        node = picked;
+                        state.node = node;
+                        this.debug(`Assigned node ${node.identifier} to guild ${player.guildId}`);
+                }
 
 		if (!node.sessionId) {
 			await this.waitForNodeReady(node);
@@ -1025,14 +1057,13 @@ export class lavalinkExt extends BaseExtension {
 		return connection;
 	}
 
-	private async startNextOnLavalink(player: Player, ignoreLoop = false): Promise<boolean> {
-		const node = await this.ensureNodeForPlayer(player);
-		const state = this.playerStates.get(player);
-		if (!state) throw new Error("Missing state for player");
+        private async startNextOnLavalink(player: Player, ignoreLoop = false): Promise<boolean> {
+                const state = this.playerStates.get(player);
+                if (!state) throw new Error("Missing state for player");
 
-		const track = player.queue.next(ignoreLoop || state.skipNext);
-		state.skipNext = false;
-		if (!track) {
+                const track = player.queue.next(ignoreLoop || state.skipNext);
+                state.skipNext = false;
+                if (!track) {
 			if (player.queue.autoPlay()) {
 				const nextAuto = player.queue.willNextTrack();
 				if (nextAuto) {
@@ -1040,18 +1071,21 @@ export class lavalinkExt extends BaseExtension {
 					return this.startNextOnLavalink(player, true);
 				}
 			}
-			state.playing = false;
-			state.paused = false;
-			state.track = null;
-			player.isPlaying = false;
-			player.isPaused = false;
-			player.emit("queueEnd");
-			(player as any).scheduleLeave?.();
-			return false;
-		}
+                        state.playing = false;
+                        state.paused = false;
+                        state.track = null;
+                        player.isPlaying = false;
+                        player.isPaused = false;
+                        player.emit("queueEnd");
+                        (player as any).scheduleLeave?.();
+                        await this.destroyLavalinkPlayer(player);
+                        return false;
+                }
 
-		(player as any).clearLeaveTimeout?.();
-		await (player as any).generateWillNext?.();
+                const node = await this.ensureNodeForPlayer(player);
+
+                (player as any).clearLeaveTimeout?.();
+                await (player as any).generateWillNext?.();
 		try {
 			await this.waitForVoice(player);
 		} catch (error) {
@@ -1097,19 +1131,87 @@ export class lavalinkExt extends BaseExtension {
 		});
 	}
 
-	private async destroyLavalinkPlayer(player: Player): Promise<void> {
-		const state = this.playerStates.get(player);
-		if (!state?.node?.sessionId) return;
-		try {
-			await state.node.rest.delete(`/sessions/${state.node.sessionId}/players/${player.guildId}`);
-		} catch (error) {
-			this.debug(`Failed to destroy Lavalink player for ${player.guildId}`, error);
-		}
-		state.node.players.delete(player.guildId);
-		state.track = null;
-		state.playing = false;
-		state.paused = false;
-	}
+        private async destroyLavalinkPlayer(player: Player): Promise<void> {
+                const state = this.playerStates.get(player);
+                const node = state?.node;
+                if (!state || !node) {
+                        this.cleanupIdleNodes();
+                        return;
+                }
+                if (node.sessionId) {
+                        try {
+                                await node.rest.delete(`/sessions/${node.sessionId}/players/${player.guildId}`);
+                        } catch (error) {
+                                this.debug(`Failed to destroy Lavalink player for ${player.guildId}`, error);
+                        }
+                }
+                node.players.delete(player.guildId);
+                if (state.node === node) {
+                        state.node = undefined;
+                }
+                state.track = null;
+                state.playing = false;
+                state.paused = false;
+                this.cleanupIdleNodes();
+        }
+
+        private cleanupIdleNodes(): void {
+                for (const state of this.playerStates.values()) {
+                        if (
+                                state.awaitingNode ||
+                                state.awaitingTrack ||
+                                state.playing ||
+                                state.paused ||
+                                (state.node && state.node.players.size > 0)
+                        ) {
+                                return;
+                        }
+                }
+
+                for (const node of this.nodes) {
+                        if (node.players.size > 0) {
+                                return;
+                        }
+                }
+
+                for (const node of this.nodes) {
+                        if (!node.ws || node.closing) continue;
+                        const ready = node.ws.readyState;
+                        if (ready === WebSocket.CLOSING || ready === WebSocket.CLOSED) continue;
+                        this.debug(`Closing idle node ${node.identifier}`);
+                        this.closeNode(node, 1000, "Idle cleanup");
+                }
+        }
+
+        private closeNode(node: InternalNode, code = 1000, reason?: string): void {
+                if (!node.ws) return;
+                const ready = node.ws.readyState;
+                if (ready === WebSocket.CLOSING || ready === WebSocket.CLOSED) return;
+
+                node.closing = true;
+                const ws = node.ws;
+                const handleClose = () => {
+                        node.closing = false;
+                        node.connected = false;
+                        node.connecting = false;
+                        node.ws = undefined;
+                        node.sessionId = undefined;
+                        node.resumed = false;
+                        node.stats = undefined;
+                        node.lastPing = undefined;
+                        node.players.clear();
+                        node.reconnectAttempts = 0;
+                };
+                ws.once("close", handleClose);
+
+                try {
+                        ws.close(code, reason ?? "Idle");
+                } catch (error) {
+                        ws.removeListener("close", handleClose);
+                        handleClose();
+                        this.debug(`Failed to close node ${node.identifier}`, error);
+                }
+        }
 
 	private async sendVoiceUpdate(node: InternalNode, guildId: string, state: LavalinkPlayerState): Promise<void> {
 		if (!node.ws || node.ws.readyState !== WebSocket.OPEN) return;
@@ -1150,19 +1252,24 @@ export class lavalinkExt extends BaseExtension {
 		return true;
 	}
 
-	private stop(player: Player): boolean {
-		const state = this.playerStates.get(player);
-		if (!state?.node) return false;
-		player.queue.clear();
-		state.track = null;
-		state.playing = false;
-		state.paused = false;
-		player.isPlaying = false;
-		player.isPaused = false;
-		player.emit("playerStop");
-		this.updatePlayer(state.node, player.guildId, { encodedTrack: null }).catch((error) => this.debug(`Stop failed`, error));
-		return true;
-	}
+        private stop(player: Player): boolean {
+                const state = this.playerStates.get(player);
+                if (!state?.node) return false;
+                player.queue.clear();
+                state.track = null;
+                state.playing = false;
+                state.paused = false;
+                player.isPlaying = false;
+                player.isPaused = false;
+                player.emit("playerStop");
+                this.updatePlayer(state.node, player.guildId, { encodedTrack: null }).catch((error) =>
+                        this.debug(`Stop failed`, error),
+                );
+                this.destroyLavalinkPlayer(player).catch((error) =>
+                        this.debug(`Failed to destroy Lavalink player after stop for ${player.guildId}`, error),
+                );
+                return true;
+        }
 
 	private skip(player: Player): boolean {
 		const state = this.playerStates.get(player);
